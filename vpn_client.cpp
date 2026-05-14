@@ -7,6 +7,7 @@
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/hmac.h>
+#include <openssl/crypto.h>
 #include <vector>
 #include <thread>
 #include <atomic>
@@ -14,6 +15,9 @@
 #include <cstdint>
 #include <netioapi.h>
 #include <iphlpapi.h>
+#include <cstdlib>
+#include <cstring>
+#include <cstdio>
 
 #pragma comment(lib, "Iphlpapi.lib")
 #pragma comment(lib, "ws2_32.lib")
@@ -199,7 +203,7 @@ BOOL WINAPI ConsoleCtrlHandler(DWORD ctrlType) {
         // Restore routing table
         system("route delete 0.0.0.0 > nul 2>&1");
         system(("route add 0.0.0.0 mask 0.0.0.0 " + g_gateway_ip + " metric 1").c_str());
-        system(("route delete " + g_server_ip + " > nul 2>&1").c_str());
+        // system(("route delete " + g_server_ip + " > nul 2>&1").c_str());
 
         // Close socket to unblock recv()
         if (g_sock != INVALID_SOCKET) {
@@ -217,7 +221,14 @@ BOOL WINAPI ConsoleCtrlHandler(DWORD ctrlType) {
 
 // --- Main ---
 int main(int argc, char* argv[]) {
+    cout << "[DEBUG] Program started\n";
+    MessageBoxA(NULL,
+                "Reached main()",
+                "DEBUG",
+                MB_OK);
 
+    printf("[DEBUG] main entered\n");
+    fflush(stdout);
     // 1. Parse CLI arguments
     if (argc < 3) {
         cerr << "Usage: " << argv[0] << " <SERVER_IP> <GATEWAY_IP> [PSK_HEX]\n";
@@ -438,11 +449,13 @@ int main(int argc, char* argv[]) {
     timeout = 1000;
     setsockopt(g_sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
 
-    // 8. Routing (redirect all traffic through VPN)
-    string bypass = "route add " + g_server_ip + " mask 255.255.255.255 " + g_gateway_ip + " metric 1";
-    system(bypass.c_str());
-    system("route delete 0.0.0.0");
-    system("route add 0.0.0.0 mask 0.0.0.0 10.0.0.1 metric 5");
+    // 8. Routing (redirect server traffic to bypass route, keep normal Internet for now)
+    // string bypass = "route add " + g_server_ip + " mask 255.255.255.255 " + g_gateway_ip + " metric 1";
+    // system(bypass.c_str());
+    // DISABLED for testing: default route manipulation that was breaking WiFi
+    // system("route delete 0.0.0.0 mask 0.0.0.0 > nul 2>&1");
+    // string defaultRoute = "netsh interface ipv4 add route prefix=0.0.0.0/0 interface=" + to_string(vpnIdx) + " nextHop=10.0.0.1 metric=5";
+    // if (system(defaultRoute.c_str()) != 0) { cerr << "[WARNING] Default route addition failed.\n"; }
 
     // 9. Start Wintun session
     WINTUN_SESSION_HANDLE sess = WintunStartSession(adapter, 0x400000);
@@ -462,6 +475,7 @@ int main(int argc, char* argv[]) {
 
     // 10. RECEIVER THREAD (Server -> Wintun)
     thread rx([&]() {
+        uint64_t packets_recv = 0, bytes_recv = 0;
         unsigned char buf[2048];
         while (g_running) {
             int r = recv(g_sock, (char*)buf, 2048, 0); // FIX: recv() works after connect()
@@ -472,15 +486,20 @@ int main(int argc, char* argv[]) {
                     if (wp) {
                         memcpy(wp, p.data(), p.size());
                         WintunSendPacket(sess, wp);
+                        packets_recv++;
+                        bytes_recv += p.size();
+                        if (packets_recv % 100 == 0) {
+                            cout << "[TUNNEL] Received " << packets_recv << " packets (" << bytes_recv << " bytes decrypted)\n";
+                        }
                     }
                 }
             }
             // On timeout or error, loop re-checks g_running
         }
     });
-    rx.detach(); // FIX: Detach thread to prevent std::terminate on exit
 
     // 11. SENDER LOOP (Wintun -> Server)
+    uint64_t packets_sent = 0, bytes_sent = 0;
     while (g_running) {
         uint32_t p_size = 0;
         unsigned char* pkt = WintunReceivePacket(sess, &p_size);
@@ -493,6 +512,11 @@ int main(int argc, char* argv[]) {
 
             if (!enc.empty()) {
                 send(g_sock, (char*)enc.data(), (int)enc.size(), 0); // FIX: send() after connect()
+                packets_sent++;
+                bytes_sent += enc.size();
+                if (packets_sent % 100 == 0) {
+                    cout << "[TUNNEL] Sent " << packets_sent << " packets (" << bytes_sent << " bytes encrypted)\n";
+                }
             }
 
             WintunReleaseReceivePacket(sess, pkt);
@@ -500,6 +524,10 @@ int main(int argc, char* argv[]) {
             // Wait with timeout so we can check g_running periodically
             WaitForSingleObject(WintunGetReadWaitEvent(sess), 1000);
         }
+    }
+
+    if (rx.joinable()) {
+        rx.join();
     }
 
     // Cleanup (reached if g_running set to false without signal handler exit)

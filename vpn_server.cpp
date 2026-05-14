@@ -7,6 +7,7 @@
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/hmac.h>
+#include <openssl/crypto.h>
 #include <vector>
 #include <thread>
 #include <atomic>
@@ -14,6 +15,9 @@
 #include <cstdint>
 #include <netioapi.h>
 #include <iphlpapi.h>
+#include <cstdlib>
+#include <cstring>
+#include <cstdio>
 
 #pragma comment(lib, "Iphlpapi.lib")
 #pragma comment(lib, "ws2_32.lib")
@@ -140,8 +144,8 @@ vector<unsigned char> derive(EVP_PKEY* priv, const unsigned char* pub_bytes) {
 }
 
 vector<unsigned char> compute_handshake_hmac(const unsigned char* psk, int psk_len,
-                                             const unsigned char* client_pub,
-                                             const unsigned char* server_pub) {
+                                            const unsigned char* client_pub,
+                                            const unsigned char* server_pub) {
     unsigned char msg[64];
     memcpy(msg, client_pub, 32);
     memcpy(msg + 32, server_pub, 32);
@@ -193,14 +197,24 @@ BOOL WINAPI ConsoleCtrlHandler(DWORD ctrlType) {
 }
 
 int main(int argc, char* argv[]) {
+    // Disable buffering for immediate output
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+
+    
+    printf("[DEBUG] Server starting...\n");
+    fflush(stdout);
+
+    
     if (argc < 2) {
-        cerr << "Usage: " << argv[0] << " <BIND_IP> [PSK_HEX]\n";
-        cerr << "  BIND_IP  : local address to bind UDP server (use 0.0.0.0 for all)\n";
-        cerr << "  PSK_HEX  : optional 64-char hex pre-shared key\n";
-        cerr << "Example:\n";
-        cerr << "  " << argv[0] << " 0.0.0.0 012345...\n";
+        fprintf(stderr, "Usage: %s <BIND_IP> [PSK_HEX]\n", argv[0]);
+        fprintf(stderr, "  BIND_IP  : local address to bind UDP server (use 0.0.0.0 for all)\n");
+        fprintf(stderr, "  PSK_HEX  : optional 64-char hex pre-shared key\n");
+        fflush(stderr);
         return 1;
     }
+    fprintf(stdout, "[DEBUG] Arguments parsed\n");
+    fflush(stdout);
 
     string bind_ip = argv[1];
     unsigned char psk[32];
@@ -210,6 +224,7 @@ int main(int argc, char* argv[]) {
         string psk_hex = argv[2];
         if (psk_hex.length() != 64) {
             cerr << "[ERROR] PSK must be exactly 64 hex characters (32 bytes).\n";
+            cerr.flush();
             return 1;
         }
         for (int i = 0; i < 32; ++i) {
@@ -220,21 +235,27 @@ int main(int argc, char* argv[]) {
     } else {
         cout << "[WARNING] No PSK provided. Handshake will be unauthenticated.\n";
     }
+    cout.flush();
 
     SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
+    cout << "[DEBUG] Console handler registered\n"; cout.flush();
 
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
         cerr << "[ERROR] WSAStartup failed: " << WSAGetLastError() << "\n";
+        cerr.flush();
         return 1;
     }
+    cout << "[DEBUG] Winsock initialized\n"; cout.flush();
 
     HMODULE w_dll = LoadLibraryA("wintun.dll");
     if (!w_dll) {
         cerr << "[ERROR] Failed to load wintun.dll. Ensure it's in the same directory.\n";
+        cerr.flush();
         WSACleanup();
         return 1;
     }
+    cout << "[DEBUG] wintun.dll loaded\n"; cout.flush();
 
     auto WintunCreateAdapter   = (WintunCreateAdapter_t)GetProcAddress(w_dll, "WintunCreateAdapter");
     auto WintunStartSession    = (WintunStartSession_t)GetProcAddress(w_dll, "WintunStartSession");
@@ -271,6 +292,12 @@ int main(int argc, char* argv[]) {
         string routeCmd = "route add 10.0.0.0 mask 255.255.255.0 0.0.0.0 IF " + to_string(vpnIdx) + " metric 1";
         if (system(routeCmd.c_str()) == 0) {
             cout << "[INFO] Route added to Interface " << vpnIdx << endl;
+        }
+        string forwardingCmd = "netsh interface ipv4 set interface " + to_string(vpnIdx) + " forwarding=enabled";
+        if (system(forwardingCmd.c_str()) == 0) {
+            cout << "[INFO] IP forwarding enabled on vpn0.\n";
+        } else {
+            cerr << "[WARNING] Failed to enable IP forwarding on vpn0.\n";
         }
     } else {
         cerr << "[WARNING] Could not detect Wintun adapter index.\n";
@@ -415,6 +442,7 @@ int main(int argc, char* argv[]) {
     cout << "[INFO] VPN tunnel established with client. Press Ctrl+C to stop.\n";
 
     thread rx([&]() {
+        uint64_t packets_recv = 0, bytes_recv = 0;
         unsigned char buf[2048];
         while (g_running) {
             int r = recv(g_sock, (char*)buf, sizeof(buf), 0);
@@ -425,12 +453,16 @@ int main(int argc, char* argv[]) {
                     if (wp) {
                         memcpy(wp, p.data(), p.size());
                         WintunSendPacket(sess, wp);
+                        packets_recv++;
+                        bytes_recv += p.size();
+                        if (packets_recv % 100 == 0) {
+                            cout << "[TUNNEL] Received " << packets_recv << " packets (" << bytes_recv << " bytes decrypted)\n";
+                        }
                     }
                 }
             }
         }
     });
-    rx.detach();
 
     while (g_running) {
         uint32_t p_size = 0;
@@ -446,6 +478,10 @@ int main(int argc, char* argv[]) {
         } else {
             WaitForSingleObject(WintunGetReadWaitEvent(sess), 1000);
         }
+    }
+
+    if (rx.joinable()) {
+        rx.join();
     }
 
     closesocket(g_sock);
